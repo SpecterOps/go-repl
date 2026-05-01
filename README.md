@@ -1,5 +1,17 @@
 # go-repl
 
+## NOTICE
+
+Forked from https://github.com/OpenEngineer/go-repl @ 9990dd87c3fb9c039d3c2d1f00ceace8906b6644.
+Changes applied:
+- Added `repl.Options` to manage internal settings knobs
+- Added the ability to render custom status bar components
+- Support for OS-level paste into input line
+- Added history load/save to file
+- Added optional `repl.Completer` interface for richer tab completion
+
+## Original README
+
 Lightweight Golang REPL library, inspired by GNU Readline. You provide the `Eval` function, and `go-repl` does the rest.
 
 Your REPLs that use this library will enjoy the following features:
@@ -32,7 +44,6 @@ Notes:
 * Performance hasn't yet been optimized and I haven't yet tested all corner cases exhaustively
 * Might not work in Windows command prompt (keystroke codes could differ, ANSI escape sequences might not be supported, the method that sets terminal to raw mode might not work)
 * No vi edit mode
-* No support for clipboards yet
 
 # Usage
 
@@ -49,6 +60,18 @@ type Handler interface {
   Eval(line string) string
 }
 ```
+
+If you want richer completion behavior (for example printing candidate lists),
+you can optionally implement:
+
+```golang
+type Completer interface {
+  Complete(buffer string) Completion
+}
+```
+
+When `Completion.Candidates` is returned, go-repl renders them in a transient popover near the prompt.
+By default it uses `overlay` mode. You can force `insert` mode with `REPL_COMPLETION_POPOVER_MODE=insert`.
 
 Here is a complete example (can also be found in `./examples/basic_repl.go`):
 

@@ -2,6 +2,8 @@ package repl
 
 import (
 	"bufio"
+	"errors"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -33,18 +35,22 @@ func newStdinReader() *_StdinReader {
 
 func (r *_StdinReader) start() {
 	go func() {
+		ticker := time.NewTicker(MACHINE_INTERVAL)
+		defer ticker.Stop()
+
 		for {
-			<-time.After(MACHINE_INTERVAL)
+			<-ticker.C
 
 			r.lock.Lock()
 
 			if len(r.buffer) > 0 {
 				if time.Now().After(r.lastTime.Add(MACHINE_INTERVAL)) {
 					msg := r.buffer
-
 					r.buffer = make([]byte, 0)
+					r.lock.Unlock()
 
 					r.bytes <- msg
+					continue
 				}
 			}
 
@@ -54,36 +60,42 @@ func (r *_StdinReader) start() {
 }
 
 func (r *_StdinReader) read() {
+	r.lock.Lock()
 	if r.reader != nil {
+		r.lock.Unlock()
 		return
 	}
 
 	r.reader = bufio.NewReader(os.Stdin)
 	r.lastTime = time.Now()
+	r.lock.Unlock()
 
 	go func() {
 		for {
 			b, err := r.reader.ReadByte()
 			if err != nil {
+				if errors.Is(err, io.EOF) {
+					return
+				}
+
 				panic(err)
 			}
 
 			stopNow := false
+			r.lock.Lock()
 			if b == 13 && time.Now().After(r.lastTime.Add(MACHINE_INTERVAL)) {
 				// it is unlikely that a carriage return followed by some text is pasted into the terminal, so we can use this as a queu to quit
 				stopNow = true
 			}
 
 			r.lastTime = time.Now()
-
-			r.lock.Lock()
-
 			r.buffer = append(r.buffer, b)
-
 			r.lock.Unlock()
 
 			if stopNow {
+				r.lock.Lock()
 				r.reader = nil
+				r.lock.Unlock()
 				return
 			}
 		}

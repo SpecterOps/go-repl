@@ -65,6 +65,18 @@ func clearRows(n int) {
 	}
 }
 
+func insertLines(n int) {
+	if n > 0 {
+		csi1(n, 'L')
+	}
+}
+
+func deleteLines(n int) {
+	if n > 0 {
+		csi1(n, 'M')
+	}
+}
+
 // input: 0-based
 // moves to 1-based
 func moveToCol(x int) {

@@ -7,7 +7,7 @@ import (
 	"strings"
 	"time"
 
-	repl "github.com/openengineer/go-repl"
+	repl "github.com/specterops/go-repl"
 )
 
 var helpMessage = `help              display this message

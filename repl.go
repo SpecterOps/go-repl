@@ -2,34 +2,48 @@
 package repl
 
 import (
+	"bufio"
+	"bytes"
 	"fmt"
-	"strconv"
-
+	"io"
 	"os"
 	"regexp"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"golang.org/x/term"
 )
 
-var (
-	// Period between polls for terminal size changes.
-	// 10ms is the default, human reaction times are an order of magnitude slower than this interval,
-	// and auto generated escape sequence bytes are an order of magnitude faster than this interval.
-	SIZE_POLLING_INTERVAL = 10 * time.Millisecond
+// Period between polls for terminal size changes.
+// 10ms is the default, human reaction times are an order of magnitude slower than this interval,
+// and auto generated escape sequence bytes are an order of magnitude faster than this interval.
+var SIZE_POLLING_INTERVAL = 10 * time.Millisecond
 
-	// Used by the package maintainer:
-	DEBUG = "" // a non-empty string specifies the destination file for debugging info
+type (
+	StatusWidgetFn  func(*Repl) string
+	StatusWidgetFns struct {
+		Left  StatusWidgetFn
+		Right StatusWidgetFn
+	}
+	completionPopover struct {
+		anchorRow int
+		height    int
+		promptRow int
+		inserted  bool
+	}
 )
 
 type Repl struct {
 	handler Handler
 
-	history     [][]byte // simply keep everything, it doesn't matter
-	historyDir  string   // directory where to store history files
-	historyIdx  int      // -1 for last
-	historyFile *os.File // open history file, so we can keep appending
+	StatusWidgets *StatusWidgetFns
+
+	history         [][]byte // simply keep everything, it doesn't matter
+	historyIdx      int      // -1 for last
+	historyMaxLines int
+	historyFile     *os.File // open history file, so we can keep appending
 
 	phraseRe *regexp.Regexp
 
@@ -46,41 +60,64 @@ type Repl struct {
 	width     int
 	height    int
 
+	frameLock sync.Mutex
+	bufLock   sync.Mutex
+
+	completionPopover *completionPopover
+
 	onEnd func()
 	debug *os.File
 }
 
-// Create a new Repl using your custom Handler.
-func NewRepl(handler Handler) *Repl {
+type Options struct {
+	// HistoryFilePath is the path to the file that console history is stored in
+	HistoryFilePath string
+	// HistoryFileMaxLines is the maximum number of lines of the history that should be kept
+	// before it gets truncated
+	HistoryMaxLines int
+	// StatusWidgets is a struct containing widgets used for content when rendering the status
+	// bar to screen
+	StatusWidgets *StatusWidgetFns
+}
 
+// Create a new Repl using your custom Handler.
+func NewRepl(handler Handler, opts *Options) *Repl {
 	r := &Repl{
-		handler:     handler,
-		historyDir:  "",
-		history:     make([][]byte, 0),
-		historyIdx:  -1,
-		historyFile: nil,
-		phraseRe:    regexp.MustCompile(`([0-9a-zA-Z_\-\.]+)`),
-		reader:      newStdinReader(),
-		buffer:      nil,
-		backup:      nil,
-		prevDel:     nil,
-		filter:      nil,
-		bufferPos:   0,
-		viewStart:   0,
-		viewEnd:     -1,
-		promptRow:   -1,
-		width:       0,
-		height:      0,
-		onEnd:       nil,
-		debug:       nil,
+		handler:           handler,
+		history:           make([][]byte, 0),
+		historyIdx:        -1,
+		historyFile:       nil,
+		historyMaxLines:   1000,
+		phraseRe:          regexp.MustCompile(`([0-9a-zA-Z_\-\.]+)`),
+		reader:            newStdinReader(),
+		buffer:            nil,
+		backup:            nil,
+		prevDel:           nil,
+		filter:            nil,
+		bufferPos:         0,
+		viewStart:         0,
+		viewEnd:           -1,
+		promptRow:         -1,
+		width:             0,
+		height:            0,
+		completionPopover: nil,
+		onEnd:             nil,
+		debug:             nil,
 	}
 
-	if DEBUG != "" {
-		debug, err := os.Create(DEBUG)
+	debug := os.Getenv("REPL_DEBUG_LOG")
+	if debug != "" {
+		debug, err := os.Create(debug)
 		if err != nil {
-			panic(err)
+			panic(fmt.Errorf("error start repl (debug): %w", err))
 		}
 		r.debug = debug
+	}
+
+	if opts != nil {
+		if err := r.loadOptions(opts); err != nil {
+			panic(fmt.Errorf("error starting repl (options): %w", err))
+		}
 	}
 
 	return r
@@ -90,11 +127,108 @@ func NewRepl(handler Handler) *Repl {
 // internal methods
 ///////////////////
 
+func (r *Repl) loadOptions(opts *Options) error {
+	if opts.HistoryFilePath != "" {
+		// Open history file from HistoryFilePath
+		historyFile, err := os.OpenFile(opts.HistoryFilePath, os.O_CREATE|os.O_RDWR|io.SeekStart, 0o660)
+		if err != nil {
+			return fmt.Errorf("could not open history file: %w", err)
+		}
+
+		r.historyFile = historyFile
+
+		// Load history file into the buffer
+		if err := r.loadHistory(); err != nil {
+			return fmt.Errorf("could not load history from file: %w", err)
+		}
+	}
+
+	if opts.HistoryMaxLines > 0 {
+		r.historyMaxLines = opts.HistoryMaxLines
+	}
+
+	r.StatusWidgets = opts.StatusWidgets
+
+	return nil
+}
+
+func (r *Repl) loadHistory() error {
+	historyReader := bufio.NewReader(r.historyFile)
+	reading := true
+	for reading {
+		line, err := historyReader.ReadBytes('\n')
+		if err != nil {
+			switch err {
+			case io.EOF:
+				reading = false
+			default:
+				return fmt.Errorf("could not read from history file: %w", err)
+			}
+		}
+
+		if line == nil {
+			continue
+		}
+
+		r.history = append(r.history, bytes.TrimSpace(line))
+	}
+
+	return nil
+}
+
+func (r *Repl) saveHistory() error {
+	if r.historyFile == nil {
+		return nil
+	}
+
+	if err := r.historyFile.Truncate(0); err != nil {
+		return fmt.Errorf("could not truncate history file: %w", err)
+	}
+
+	if _, err := r.historyFile.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("could not seek to beginning after truncate: %w", err)
+	}
+
+	// truncate history buffer before save.
+	if len(r.history) > r.historyMaxLines {
+		r.history = r.history[len(r.history)-r.historyMaxLines:]
+	}
+
+	historyWriter := bufio.NewWriter(r.historyFile)
+	for _, line := range r.history {
+		line := bytes.TrimSpace(line)
+		// Filter blank lines
+		if len(line) == 0 {
+			continue
+		}
+
+		if n, err := historyWriter.Write(append(line, byte('\n'))); n < len(line) || err != nil {
+			return fmt.Errorf("could not write history to file (%d bytes written): %w", n, err)
+		}
+	}
+
+	if err := historyWriter.Flush(); err != nil {
+		return fmt.Errorf("could not flush writer: %w", err)
+	}
+
+	if err := r.historyFile.Close(); err != nil {
+		return fmt.Errorf("could not close history file: %w", err)
+	}
+
+	return nil
+}
+
 func (r *Repl) getWidth() int {
+	r.frameLock.Lock()
+	defer r.frameLock.Unlock()
+
 	return r.width
 }
 
 func (r *Repl) getHeight() int {
+	r.frameLock.Lock()
+	defer r.frameLock.Unlock()
+
 	return r.height
 }
 
@@ -112,24 +246,36 @@ func (r *Repl) log(format string, args ...interface{}) {
 	}
 }
 
-func (r *Repl) notifySizeChange() {
-	getSize := func() (int, int) {
-		w, h, err := term.GetSize(0)
-		if err != nil {
-			panic(err)
-		}
-
-		return w, h
+func getTermSize() (int, int, error) {
+	w, h, err := term.GetSize(0)
+	if err != nil {
+		return 0, 0, fmt.Errorf("could not get size; not an interactive terminal?: %w", err)
 	}
 
-	r.width, r.height = getSize()
+	return w, h, nil
+}
+
+func (r *Repl) notifySizeChange() {
+	if width, height, err := getTermSize(); err != nil {
+		return
+	} else {
+		r.frameLock.Lock()
+		r.width = width
+		r.height = height
+		r.frameLock.Unlock()
+	}
 
 	go func() {
+		ticker := time.NewTicker(SIZE_POLLING_INTERVAL)
+		defer ticker.Stop()
+
 		for {
-			<-time.After(SIZE_POLLING_INTERVAL)
+			<-ticker.C
 
-			newW, newH := getSize()
-
+			newW, newH, err := getTermSize()
+			if err != nil {
+				continue
+			}
 			r.resize(newW, newH)
 		}
 	}()
@@ -137,7 +283,13 @@ func (r *Repl) notifySizeChange() {
 
 func (r *Repl) resize(w, h int) {
 	if w != r.width || h != r.height {
+		if r.completionPopoverVisible() {
+			r.clearCompletionPopover()
+		}
+
+		r.frameLock.Lock()
 		r.width, r.height = w, h
+		r.frameLock.Unlock()
 
 		r.force(r.buffer, r.bufferPos)
 	}
@@ -154,11 +306,92 @@ func (r *Repl) stopSearch() {
 	r.writeStatus()
 }
 
+func (r *Repl) completionPopoverVisible() bool {
+	return r.completionPopover != nil
+}
+
+func (r *Repl) completionPopoverMode() string {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv("REPL_COMPLETION_POPOVER_MODE"))) {
+	case "insert":
+		return "insert"
+	}
+
+	return "overlay"
+}
+
+func isCursorQueryResponse(b []byte) bool {
+	n := len(b)
+	if n < 3 || b[n-1] != 82 {
+		return false
+	}
+
+	for i := n - 1; i >= 1; i-- {
+		if b[i-1] == 27 && b[i] == 91 {
+			return true
+		}
+	}
+
+	return false
+}
+
+func (r *Repl) clearCompletionPopover() {
+	popover := r.completionPopover
+	if popover == nil {
+		return
+	}
+
+	r.completionPopover = nil
+
+	if popover.height <= 0 {
+		return
+	}
+
+	if popover.inserted {
+		if r.statusVisible() {
+			moveCursorTo(0, r.getHeight()-1)
+			clearRow()
+		}
+
+		moveCursorTo(0, popover.anchorRow)
+		deleteLines(popover.height)
+	} else {
+		for i := 0; i < popover.height; i++ {
+			moveCursorTo(0, popover.anchorRow+i)
+			clearRow()
+		}
+	}
+
+	r.updatePromptRow(popover.promptRow)
+}
+
+func (r *Repl) dismissCompletionPopover() {
+	if !r.completionPopoverVisible() {
+		return
+	}
+
+	r.clearCompletionPopover()
+	r.syncCursor()
+	r.writeStatus()
+}
+
 // turn stdin bytes into something useful
 func (r *Repl) dispatch(b []byte) {
 	n := len(b)
 
 	r.log("keypress: %v\n", b)
+
+	if r.completionPopoverVisible() {
+		if n == 1 && b[0] == 9 {
+			// keep visible for repeated tab completions
+		} else if n == 1 && b[0] == 27 {
+			r.dismissCompletionPopover()
+			return
+		} else if isCursorQueryResponse(b) {
+			// keep visible while handling terminal cursor query replies
+		} else {
+			r.dismissCompletionPopover()
+		}
+	}
 
 	if n == 1 {
 		switch b[0] {
@@ -305,9 +538,9 @@ func (r *Repl) dispatch(b []byte) {
 			} else if b[4] == 53 && b[5] == 67 {
 				r.moveRightOnePhrase()
 			} else if b[4] == 53 && b[5] == 66 {
-				//r.moveDownOneLine()
+				// r.moveDownOneLine()
 			} else if b[4] == 53 && b[5] == 65 {
-				//r.moveUpOneLine()
+				// r.moveUpOneLine()
 			}
 		} else if len(b) > 5 && b[n-1] == 82 {
 			parts := strings.Split(string(b[2:n-1]), ";")
@@ -349,7 +582,7 @@ func (r *Repl) dispatch(b []byte) {
 			}
 		}
 	} else {
-		//r.cleanAndAddToBuffer(b)
+		r.cleanAndAddToBuffer(b)
 	}
 
 	return
@@ -367,6 +600,9 @@ func (r *Repl) printPrompt() {
 }
 
 func (r *Repl) resetBuffer() {
+	r.bufLock.Lock()
+	defer r.bufLock.Unlock()
+
 	r.bufferPos = 0
 	r.buffer = make([]byte, 0)
 	r.printPrompt()
@@ -631,9 +867,13 @@ func (r *Repl) force(newBuffer []byte, bufferPos int) {
 	if calcHeight(newBuffer, r.promptLen(), r.getWidth()) > r.innerHeight() {
 		viewStart_, viewEnd_ := r.viewStart, r.viewEnd
 		r.clearScreen()
+
+		r.bufLock.Lock()
 		r.buffer = newBuffer
 		r.bufferPos = bufferPos
 		r.viewStart, r.viewEnd = viewStart_, viewEnd_
+		r.bufLock.Unlock()
+
 		r.log("viewStart: %d, viewEnd: %d\n", r.viewStart, r.viewEnd)
 		r.adjustBufferView()
 
@@ -651,11 +891,13 @@ func (r *Repl) force(newBuffer []byte, bufferPos int) {
 		// TODO: writeBytes instead
 		r.addBytesToBuffer(newBuffer)
 
+		r.bufLock.Lock()
 		if bufferPos >= r.bufferLen() {
 			bufferPos = r.bufferLen()
 		}
 
 		r.bufferPos = bufferPos
+		r.bufLock.Unlock()
 
 		r.log("bufferPos: %d, bufferLen: %d, width: %d\n", r.bufferPos, len(r.buffer), r.getWidth())
 		r.syncCursor()
@@ -921,18 +1163,227 @@ func (r *Repl) startReverseSearch() {
 	r.writeStatus()
 }
 
+func truncateCompletionLine(line string, maxWidth int) string {
+	if maxWidth <= 0 {
+		return ""
+	}
+
+	if len(line) <= maxWidth {
+		return line
+	}
+
+	if maxWidth <= 3 {
+		return line[0:maxWidth]
+	}
+
+	return line[0:maxWidth-3] + "..."
+}
+
+func completionPopoverLines(completion Completion) []string {
+	lines := make([]string, 0, len(completion.Candidates)+1)
+	if completion.Message != "" {
+		lines = append(lines, completion.Message)
+	}
+
+	lines = append(lines, completion.Candidates...)
+
+	const maxContentLines = 12
+	if len(lines) > maxContentLines {
+		if maxContentLines == 1 {
+			lines = []string{fmt.Sprintf("%d matches", len(lines))}
+		} else {
+			hidden := len(lines) - (maxContentLines - 1)
+			lines = append(lines[0:maxContentLines-1], fmt.Sprintf("... %d more", hidden))
+		}
+	}
+
+	return lines
+}
+
+func clampCompletionLines(lines []string, maxContentRows int) []string {
+	if maxContentRows <= 0 {
+		return nil
+	}
+
+	if len(lines) <= maxContentRows {
+		return lines
+	}
+
+	if maxContentRows == 1 {
+		return []string{fmt.Sprintf("%d matches", len(lines))}
+	}
+
+	hidden := len(lines) - (maxContentRows - 1)
+	return append(lines[0:maxContentRows-1], fmt.Sprintf("... %d more", hidden))
+}
+
+func (r *Repl) completionRowsBelowPrompt() int {
+	statusRow := r.getHeight()
+	if r.statusVisible() {
+		statusRow = r.getHeight() - 1
+	}
+
+	return statusRow - (r.promptRow + 1)
+}
+
+func (r *Repl) bumpScrollback(lines int) {
+	if lines <= 0 {
+		return
+	}
+
+	if r.statusVisible() {
+		moveCursorTo(0, r.getHeight()-1)
+		clearRow()
+	}
+
+	for i := 0; i < lines; i++ {
+		moveCursorTo(0, r.getHeight()-1)
+		r.newLine()
+	}
+
+	r.updatePromptRow(r.promptRow - lines)
+}
+
+func (r *Repl) showCompletionPopover(completion Completion) {
+	lines := completionPopoverLines(completion)
+	if len(lines) == 0 || r.getWidth() < 8 {
+		return
+	}
+
+	if r.promptRow < 0 {
+		queryCursorPos()
+		return
+	}
+
+	if r.completionPopoverVisible() {
+		r.clearCompletionPopover()
+	}
+
+	maxContentWidth := r.getWidth() - 4 // `| ` + ` |`
+	if maxContentWidth <= 0 {
+		return
+	}
+
+	availableBelow := r.completionRowsBelowPrompt()
+	maxPossibleBelow := availableBelow + r.promptRow
+	if maxPossibleBelow < 3 {
+		return
+	}
+
+	inserted := r.completionPopoverMode() == "insert"
+	maxContentRows := maxPossibleBelow - 2
+
+	lines = clampCompletionLines(lines, maxContentRows)
+	if len(lines) == 0 {
+		return
+	}
+
+	maxLineLen := 0
+	for idx, line := range lines {
+		line = truncateCompletionLine(line, maxContentWidth)
+		lines[idx] = line
+
+		if len(line) > maxLineLen {
+			maxLineLen = len(line)
+		}
+	}
+
+	if maxLineLen <= 0 {
+		maxLineLen = 1
+	}
+
+	height := len(lines) + 2
+	anchorRow := r.promptRow + 1
+
+	if availableBelow < height {
+		deficit := height - availableBelow
+		r.bumpScrollback(deficit)
+		anchorRow = r.promptRow + 1
+	}
+
+	if inserted {
+		r.clearStatus()
+
+		moveCursorTo(0, anchorRow)
+		insertLines(height)
+	}
+
+	moveCursorTo(0, anchorRow)
+	clearRow()
+	// border top
+	fmt.Print("┌" + strings.Repeat("─", maxLineLen+2) + "┐")
+
+	for idx, line := range lines {
+		moveCursorTo(0, anchorRow+1+idx)
+		clearRow()
+		fmt.Print("│ ")
+		fmt.Print(line)
+
+		if padding := maxLineLen - len(line); padding > 0 {
+			fmt.Print(strings.Repeat(" ", padding))
+		}
+
+		fmt.Print(" │")
+	}
+
+	moveCursorTo(0, anchorRow+height-1)
+	clearRow()
+	// border bottom
+	fmt.Print("└" + strings.Repeat("─", maxLineLen+2) + "┘")
+
+	r.completionPopover = &completionPopover{
+		anchorRow: anchorRow,
+		height:    height,
+		promptRow: r.promptRow,
+		inserted:  inserted,
+	}
+
+	r.syncCursor()
+	r.writeStatus()
+}
+
 func (r *Repl) tab() {
 	prec := string(r.buffer[0:r.bufferPos])
+
+	if completer, ok := r.handler.(Completer); ok {
+		completion := completer.Complete(prec)
+
+		if len(completion.Insert) > 0 {
+			if r.completionPopoverVisible() {
+				r.dismissCompletionPopover()
+			}
+
+			r.addBytesToBuffer([]byte(completion.Insert))
+			r.writeStatus()
+			return
+		}
+
+		if len(completion.Message) > 0 || len(completion.Candidates) > 0 {
+			r.showCompletionPopover(completion)
+		} else if r.completionPopoverVisible() {
+			r.dismissCompletionPopover()
+		}
+
+		return
+	}
+
+	if r.completionPopoverVisible() {
+		r.dismissCompletionPopover()
+	}
 
 	extra := r.handler.Tab(prec)
 
 	if len(extra) > 0 {
 		r.addBytesToBuffer([]byte(extra))
+		r.writeStatus()
 	}
 }
 
 func (r *Repl) quit() {
 	r.clearAfterPrompt()
+	if err := r.saveHistory(); err != nil {
+		r.log("could not save history: %v", err)
+	}
 
 	fmt.Print("\n\r")
 
@@ -977,6 +1428,7 @@ func (r *Repl) backspaceActiveBuffer() {
 		r.backspace()
 	}
 }
+
 func (r *Repl) backspace() {
 	n := r.bufferLen()
 
@@ -1193,13 +1645,16 @@ func (r *Repl) newLine() {
 	// every newLine means the status line is pushed below
 }
 
-// one left aligned and one right aligned
-func (r *Repl) statusFields() (string, string) {
+func (r *Repl) CwdStatusWidget() string {
 	cwd, err := os.Getwd()
 	if err != nil {
 		cwd = ""
 	}
 
+	return cwd
+}
+
+func (r *Repl) VisStatusWidget() string {
 	vis := "All"
 
 	if r.viewEnd < 0 {
@@ -1214,7 +1669,25 @@ func (r *Repl) statusFields() (string, string) {
 		vis = fmt.Sprintf("%d", int(float64(r.bufferPos)/float64(r.bufferLen())*100)) + "%"
 	}
 
-	return cwd, vis
+	return vis
+}
+
+// one left aligned and one right aligned
+func (r *Repl) statusFields() (string, string) {
+	var leftWidget, rightWidget string
+	if r.StatusWidgets == nil || r.StatusWidgets.Left == nil {
+		leftWidget = r.CwdStatusWidget()
+	} else {
+		leftWidget = r.StatusWidgets.Left(r)
+	}
+
+	if r.StatusWidgets == nil || r.StatusWidgets.Right == nil {
+		rightWidget = r.VisStatusWidget()
+	} else {
+		rightWidget = r.StatusWidgets.Right(r)
+	}
+
+	return leftWidget, rightWidget
 }
 
 func (r *Repl) statusVisible() bool {
@@ -1254,7 +1727,7 @@ func (r *Repl) filterStatus() string {
 	} else if cur != -1 {
 		return fmt.Sprintf("%d/%d matches", cur+1, tot)
 	} else {
-		panic("unexpected")
+		return fmt.Sprintf("%d matches", tot)
 	}
 }
 
@@ -1288,20 +1761,30 @@ func (r *Repl) writeStatus() {
 		}
 	} else {
 		left, right := r.statusFields()
-
-		// start highlighting
-		highlight()
-
-		if len(left) > w-len(right) {
-			left = left[0 : w-len(right)]
+		if len(right) > w {
+			right = right[:w]
 		}
 
+		leftWidth := w - len(right)
+		if leftWidth < 0 {
+			leftWidth = 0
+		}
+		if len(left) > leftWidth {
+			left = left[:leftWidth]
+		}
+
+		// Start highlighting
+		highlight()
 		fmt.Print(left)
 
+		// Re-highlight in case a custom status widget blew up the colors
+		highlight()
 		for i := 0; i < w-len(left)-len(right); i++ {
 			fmt.Print(" ")
 		}
 
+		// Re-highlight in case a custom status widget blew up the colors
+		highlight()
 		fmt.Print(right)
 
 		// end highlighting
@@ -1366,8 +1849,6 @@ func (r *Repl) Loop() error {
 
 		r.dispatch(bts)
 	}
-
-	return nil
 }
 
 // Exit the REPL program cleanly. Performs the following steps:
@@ -1382,7 +1863,9 @@ func (r *Repl) Quit() {
 
 // Unset the raw mode in case you want to run a curses-like command inside your REPL session (e.g. vi or top). Remember to call MakeRaw after the command finishes.
 func (r *Repl) UnmakeRaw() {
-	r.onEnd()
+	if r.onEnd != nil {
+		r.onEnd()
+	}
 
 	r.onEnd = nil
 }

@@ -6,7 +6,7 @@ import (
 	"os/exec"
 	"strings"
 
-	repl "github.com/openengineer/go-repl"
+	repl "github.com/specterops/go-repl"
 )
 
 type ShellWrapper struct {
